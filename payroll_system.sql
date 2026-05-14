@@ -391,3 +391,69 @@ ON DUPLICATE KEY UPDATE user_id = user_id;
 -- 4. Update manager seed (rename staff1 → manager1)
 UPDATE users SET username='manager1', full_name='Sample Manager', role='Manager'
 WHERE username='staff1';
+
+-- ============================================================
+-- SECTION 8: EMPLOYEE USER ACCOUNTS (linked by email)
+-- + CURRENCY PREFERENCE + BENEFITS TABLE
+-- ============================================================
+
+-- Add currency preference to users
+ALTER TABLE users ADD COLUMN IF NOT EXISTS currency ENUM('PHP','USD') NOT NULL DEFAULT 'PHP';
+
+-- Benefits / pay components view per employee (for Benefits page)
+CREATE OR REPLACE VIEW vw_employee_benefits AS
+SELECT
+    e.employee_id,
+    CONCAT(e.first_name,' ',e.last_name) AS employee_name,
+    e.email,
+    p.base_salary,
+    pc.component_name,
+    pc.component_type,
+    pc.default_amount,
+    CASE pc.component_type
+        WHEN 'Allowance' THEN 'Benefit / Addition'
+        WHEN 'Deduction' THEN 'Statutory Deduction'
+    END AS benefit_label
+FROM employees e
+JOIN positions p ON e.position_id = p.position_id
+CROSS JOIN pay_components pc
+WHERE e.status = 'Active'
+ORDER BY e.employee_id, pc.component_type DESC, pc.component_name;
+
+-- Attendance / days worked table
+CREATE TABLE IF NOT EXISTS attendance (
+    attendance_id   INT AUTO_INCREMENT PRIMARY KEY,
+    employee_id     INT NOT NULL,
+    attendance_month TINYINT NOT NULL CHECK (attendance_month BETWEEN 1 AND 12),
+    attendance_year  SMALLINT NOT NULL,
+    days_worked     TINYINT NOT NULL DEFAULT 0,
+    days_absent     TINYINT NOT NULL DEFAULT 0,
+    days_present    TINYINT GENERATED ALWAYS AS (days_worked - days_absent) STORED,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_att_emp FOREIGN KEY (employee_id)
+        REFERENCES employees(employee_id) ON UPDATE CASCADE ON DELETE CASCADE,
+    UNIQUE KEY uq_attendance (employee_id, attendance_month, attendance_year)
+);
+
+-- Seed: sample attendance for existing employees (April + May 2025)
+INSERT IGNORE INTO attendance (employee_id, attendance_month, attendance_year, days_worked, days_absent)
+SELECT employee_id, 4, 2025, 22, 0 FROM employees;
+INSERT IGNORE INTO attendance (employee_id, attendance_month, attendance_year, days_worked, days_absent)
+SELECT employee_id, 5, 2025, 23, 1 FROM employees;
+
+-- Employee user accounts (username = employee email, password = password)
+INSERT INTO users (username, password, full_name, role)
+SELECT
+    e.email,
+    '$2y$10$2Mz4ytO1/9ZSonIpfTDcOe3kkYgTzCjEMqCre0fcRV4zvuQClg9zu',
+    CONCAT(e.first_name, ' ', e.last_name),
+    'Employee'
+FROM employees e
+WHERE NOT EXISTS (
+    SELECT 1 FROM users u WHERE u.username = e.email
+);
+
+-- Manager user account
+INSERT INTO users (username, password, full_name, role)
+VALUES ('manager1','$2y$10$2Mz4ytO1/9ZSonIpfTDcOe3kkYgTzCjEMqCre0fcRV4zvuQClg9zu','Sample Manager','Manager')
+ON DUPLICATE KEY UPDATE role='Manager';
