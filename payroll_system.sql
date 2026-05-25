@@ -457,3 +457,129 @@ WHERE NOT EXISTS (
 INSERT INTO users (username, password, full_name, role)
 VALUES ('manager1','$2y$10$2Mz4ytO1/9ZSonIpfTDcOe3kkYgTzCjEMqCre0fcRV4zvuQClg9zu','Sample Manager','Manager')
 ON DUPLICATE KEY UPDATE role='Manager';
+
+
+
+-- ============================================================
+-- SECTION 9: NEW FEATURES
+-- Run this in phpMyAdmin SQL tab on your existing database.
+-- Does NOT affect existing data.
+-- ============================================================
+
+USE payroll_system;
+
+-- ── 1. Requests table ───────────────────────────────────────
+CREATE TABLE IF NOT EXISTS requests (
+    request_id    INT AUTO_INCREMENT PRIMARY KEY,
+    employee_id   INT NOT NULL,
+    request_type  ENUM(
+        'Leave - Sick',
+        'Leave - Vacation',
+        'Absence Excuse',
+        'Name Change',
+        'Email Change',
+        'Other'
+    ) NOT NULL,
+    details       TEXT NOT NULL,
+    -- Who should handle it (auto-set by PHP based on type)
+    handled_by    ENUM('Manager','Admin') NOT NULL DEFAULT 'Manager',
+    status        ENUM('Pending','Approved','Rejected') NOT NULL DEFAULT 'Pending',
+    reviewed_by   INT NULL,         -- user_id of approver
+    reviewer_name VARCHAR(130) NULL,
+    review_note   TEXT NULL,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    reviewed_at   TIMESTAMP NULL,
+
+    CONSTRAINT fk_req_emp  FOREIGN KEY (employee_id)
+        REFERENCES employees(employee_id) ON UPDATE CASCADE ON DELETE CASCADE,
+    CONSTRAINT fk_req_reviewer FOREIGN KEY (reviewed_by)
+        REFERENCES users(user_id) ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+-- Index for fast lookup by employee and status
+CREATE INDEX IF NOT EXISTS idx_req_emp    ON requests(employee_id);
+CREATE INDEX IF NOT EXISTS idx_req_status ON requests(status);
+CREATE INDEX IF NOT EXISTS idx_req_type   ON requests(handled_by, status);
+
+-- ── 2. View: requests with employee details ──────────────────
+CREATE OR REPLACE VIEW vw_requests AS
+SELECT
+    r.request_id,
+    r.request_type,
+    r.details,
+    r.handled_by,
+    r.status,
+    r.reviewer_name,
+    r.review_note,
+    r.created_at,
+    r.reviewed_at,
+    e.employee_id,
+    CONCAT(e.first_name, ' ', e.last_name) AS employee_name,
+    e.email,
+    d.department_name,
+    p.position_title
+FROM requests r
+JOIN employees   e ON r.employee_id  = e.employee_id
+JOIN departments d ON e.department_id = d.department_id
+JOIN positions   p ON e.position_id   = p.position_id
+ORDER BY
+    FIELD(r.status, 'Pending', 'Approved', 'Rejected'),
+    r.created_at DESC;
+
+-- ── 3. Add working_days column to attendance ─────────────────
+-- Tracks how many working days exist in the month (for proration)
+ALTER TABLE attendance
+    ADD COLUMN IF NOT EXISTS working_days TINYINT NOT NULL DEFAULT 22
+        COMMENT 'Total working days in the month (excludes weekends/holidays)';
+
+-- Update existing attendance rows with a sensible default
+UPDATE attendance SET working_days = 22 WHERE working_days = 0;
+
+-- ── 4. View: attendance-aware payroll preview ────────────────
+-- Used by Process Payroll to calculate prorated salary
+CREATE OR REPLACE VIEW vw_payroll_preview AS
+SELECT
+    e.employee_id,
+    CONCAT(e.first_name, ' ', e.last_name) AS full_name,
+    d.department_name,
+    p.position_title,
+    p.base_salary,
+    -- Attendance for latest recorded period (or defaults)
+    COALESCE(a.attendance_month, MONTH(CURDATE()))  AS att_month,
+    COALESCE(a.attendance_year,  YEAR(CURDATE()))   AS att_year,
+    COALESCE(a.working_days, 22)                    AS working_days,
+    COALESCE(a.days_worked,  22)                    AS days_worked,
+    COALESCE(a.days_absent,   0)                    AS days_absent,
+    COALESCE(a.days_present, 22)                    AS days_present,
+    -- Prorated basic salary: base / working_days * days_present
+    ROUND(
+        p.base_salary / COALESCE(a.working_days, 22)
+        * COALESCE(a.days_present, 22),
+        2
+    ) AS prorated_salary,
+    -- Absence deduction amount
+    ROUND(
+        p.base_salary / COALESCE(a.working_days, 22)
+        * COALESCE(a.days_absent, 0),
+        2
+    ) AS absence_deduction
+FROM employees e
+JOIN positions   p ON e.position_id   = p.position_id
+JOIN departments d ON e.department_id = d.department_id
+LEFT JOIN attendance a
+    ON a.employee_id = e.employee_id
+WHERE e.status = 'Active';
+
+-- ── 5. Add payroll index for pagination performance ──────────
+CREATE INDEX IF NOT EXISTS idx_pay_period
+    ON payroll_records(payroll_year DESC, payroll_month DESC);
+
+CREATE INDEX IF NOT EXISTS idx_pay_emp_period
+    ON payroll_records(employee_id, payroll_year, payroll_month);
+
+-- ── 6. Add emp index for search performance ──────────────────
+CREATE INDEX IF NOT EXISTS idx_emp_name
+    ON employees(last_name, first_name);
+
+CREATE INDEX IF NOT EXISTS idx_emp_email
+    ON employees(email);

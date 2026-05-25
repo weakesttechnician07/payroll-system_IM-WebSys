@@ -8,36 +8,45 @@ require_once __DIR__ . '/auth.php';
 requireLogin();
 $current_page = basename($_SERVER['PHP_SELF'], '.php');
 $__user = currentUser();
+$db = getDB();
 
 // ── Currency toggle ──────────────────────────────────────────
 if (isset($_GET['currency'])) {
     $_SESSION['currency'] = $_GET['currency'] === 'USD' ? 'USD' : 'PHP';
-    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?') . '?' . http_build_query(array_diff_key($_GET, ['currency' => ''])));
+    $qs = $_GET; unset($qs['currency']);
+    header('Location: '.strtok($_SERVER['REQUEST_URI'],'?').($qs?'?'.http_build_query($qs):''));
     exit;
 }
 $currency = $_SESSION['currency'] ?? 'PHP';
 
-// Live USD rate (fallback 56 if fetch fails)
 function getUsdRate(): float {
     static $rate = null;
     if ($rate !== null) return $rate;
-    $rate = 56.00; // fallback
+    $rate = 56.00;
     $ctx = @stream_context_create(['http'=>['timeout'=>2]]);
     $r   = @file_get_contents('https://open.er-api.com/v6/latest/USD', false, $ctx);
-    if ($r) {
-        $d = json_decode($r, true);
-        if (isset($d['rates']['PHP'])) $rate = (float)$d['rates']['PHP'];
-    }
+    if ($r) { $d = json_decode($r, true); if (isset($d['rates']['PHP'])) $rate = (float)$d['rates']['PHP']; }
     return $rate;
 }
 
 function formatMoney(float $amount): string {
     global $currency;
-    if ($currency === 'USD') {
-        $usd = $amount / getUsdRate();
-        return '$' . number_format($usd, 2);
-    }
-    return '₱' . number_format($amount, 2);
+    if ($currency === 'USD') return '$'.number_format($amount / getUsdRate(), 2);
+    return '₱'.number_format($amount, 2);
+}
+
+// ── Pending requests badge count ─────────────────────────────
+$pendingBadge = 0;
+if (isAdmin()) {
+    $pendingBadge = (int)$db->query("SELECT COUNT(*) FROM requests WHERE status='Pending'")->fetchColumn();
+} elseif (isManager()) {
+    $pendingBadge = (int)$db->query("SELECT COUNT(*) FROM requests WHERE status='Pending' AND handled_by='Manager'")->fetchColumn();
+} elseif (isEmployee()) {
+    // Find employee_id by email
+    $eRow = $db->prepare("SELECT employee_id FROM employees WHERE email=? LIMIT 1");
+    $eRow->execute([$__user['username']]);
+    $eId = $eRow->fetchColumn();
+    if ($eId) $pendingBadge = (int)$db->prepare("SELECT COUNT(*) FROM requests WHERE employee_id=? AND status='Pending'")->execute([$eId]);
 }
 ?>
 <!DOCTYPE html>
@@ -50,12 +59,7 @@ function formatMoney(float $amount): string {
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --primary:#1a1a2e;--accent:#e94560;--accent2:#0f3460;
-            --surface:#16213e;--card-bg:#1a2744;--text-main:#e8eaf0;
-            --text-muted:#8892a4;--border:#2a3a5c;--success:#2ecc71;
-            --warning:#f39c12;--danger:#e74c3c;
-        }
+        :root{--primary:#1a1a2e;--accent:#e94560;--accent2:#0f3460;--surface:#16213e;--card-bg:#1a2744;--text-main:#e8eaf0;--text-muted:#8892a4;--border:#2a3a5c;--success:#2ecc71;--warning:#f39c12;--danger:#e74c3c;}
         *{box-sizing:border-box;margin:0;padding:0;}
         body{background:var(--primary);color:var(--text-main);font-family:'DM Sans',sans-serif;min-height:100vh;}
         .sidebar{width:240px;min-height:100vh;background:var(--surface);border-right:1px solid var(--border);position:fixed;top:0;left:0;display:flex;flex-direction:column;z-index:100;}
@@ -63,9 +67,10 @@ function formatMoney(float $amount): string {
         .sidebar-brand .logo-mark{font-family:'Syne',sans-serif;font-weight:800;font-size:1.4rem;color:var(--accent);}
         .sidebar-brand small{display:block;font-size:0.7rem;color:var(--text-muted);letter-spacing:2px;text-transform:uppercase;margin-top:2px;}
         .nav-section-label{font-size:0.65rem;letter-spacing:2px;text-transform:uppercase;color:var(--text-muted);padding:20px 24px 8px;}
-        .sidebar .nav-link{display:flex;align-items:center;gap:12px;padding:10px 24px;color:var(--text-muted);font-size:0.88rem;font-weight:400;border-left:3px solid transparent;transition:all 0.2s;text-decoration:none;}
+        .sidebar .nav-link{display:flex;align-items:center;gap:12px;padding:10px 24px;color:var(--text-muted);font-size:0.88rem;font-weight:400;border-left:3px solid transparent;transition:all 0.2s;text-decoration:none;position:relative;}
         .sidebar .nav-link:hover,.sidebar .nav-link.active{color:var(--text-main);background:rgba(233,69,96,0.08);border-left-color:var(--accent);}
         .sidebar .nav-link i{font-size:1rem;min-width:20px;}
+        .nav-badge{background:var(--accent);color:#fff;border-radius:10px;font-size:0.65rem;font-weight:700;padding:2px 6px;margin-left:auto;}
         .main-content{margin-left:240px;padding:32px 36px;min-height:100vh;}
         .page-header{margin-bottom:28px;}
         .page-header h1{font-family:'Syne',sans-serif;font-weight:700;font-size:1.8rem;color:var(--text-main);}
@@ -86,17 +91,21 @@ function formatMoney(float $amount): string {
         .form-control:focus,.form-select:focus{background:var(--primary);border-color:var(--accent);color:var(--text-main);box-shadow:0 0 0 3px rgba(233,69,96,0.15);}
         .form-control::placeholder{color:var(--text-muted);}
         .form-label{font-size:0.8rem;font-weight:500;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:6px;}
-        .btn-accent{background:var(--accent);color:#fff;border:none;border-radius:8px;font-weight:500;font-size:0.875rem;padding:9px 20px;transition:all 0.2s;}
+        .btn-accent{background:var(--accent);color:#fff;border:none;border-radius:8px;font-weight:500;font-size:0.875rem;padding:9px 20px;transition:all 0.2s;cursor:pointer;}
         .btn-accent:hover{background:#c73652;color:#fff;transform:translateY(-1px);}
-        .btn-outline-accent{border:1px solid var(--accent);color:var(--accent);background:transparent;border-radius:8px;font-size:0.875rem;padding:7px 16px;transition:all 0.2s;}
+        .btn-outline-accent{border:1px solid var(--accent);color:var(--accent);background:transparent;border-radius:8px;font-size:0.875rem;padding:7px 16px;transition:all 0.2s;cursor:pointer;}
         .btn-outline-accent:hover{background:var(--accent);color:#fff;}
         .badge-active{background:rgba(46,204,113,0.15);color:var(--success);border-radius:20px;padding:4px 10px;font-size:0.75rem;}
         .badge-inactive{background:rgba(231,76,60,0.15);color:var(--danger);border-radius:20px;padding:4px 10px;font-size:0.75rem;}
         .alert-success-dark{background:rgba(46,204,113,0.1);border:1px solid rgba(46,204,113,0.3);color:var(--success);border-radius:8px;padding:12px 16px;}
         .alert-danger-dark{background:rgba(231,76,60,0.1);border:1px solid rgba(231,76,60,0.3);color:var(--danger);border-radius:8px;padding:12px 16px;}
-        .divider{border-top:1px solid var(--border);margin:24px 0;}
         .text-accent{color:var(--accent);}
         .text-muted{color:var(--text-muted)!important;}
+        /* Pagination */
+        .pagination .page-link{background:var(--card-bg);border-color:var(--border);color:var(--text-muted);}
+        .pagination .page-link:hover{background:var(--accent);border-color:var(--accent);color:#fff;}
+        .pagination .page-item.active .page-link{background:var(--accent);border-color:var(--accent);color:#fff;}
+        .pagination .page-item.disabled .page-link{background:var(--surface);color:var(--text-muted);opacity:0.5;}
         /* Currency toggle */
         .currency-toggle{display:flex;gap:4px;align-items:center;}
         .currency-toggle a{font-size:0.72rem;padding:3px 8px;border-radius:6px;text-decoration:none;color:var(--text-muted);border:1px solid var(--border);transition:all 0.2s;}
@@ -121,6 +130,11 @@ function formatMoney(float $amount): string {
     <a href="benefits.php" class="nav-link <?= $current_page==='benefits' ?'active':'' ?>"><i class="bi bi-gift"></i> My Benefits</a>
     <div class="nav-section-label">Payroll</div>
     <a href="history.php"  class="nav-link <?= $current_page==='history'  ?'active':'' ?>"><i class="bi bi-clock-history"></i> My Payroll History</a>
+    <div class="nav-section-label">Requests</div>
+    <a href="requests.php" class="nav-link <?= $current_page==='requests' ?'active':'' ?>">
+        <i class="bi bi-inbox"></i> My Requests
+        <?php if ($pendingBadge > 0): ?><span class="nav-badge"><?= $pendingBadge ?></span><?php endif; ?>
+    </a>
 
     <?php elseif (isManager()): ?>
     <!-- ── MANAGER SIDEBAR ── -->
@@ -129,6 +143,11 @@ function formatMoney(float $amount): string {
     <a href="employees.php"class="nav-link <?= $current_page==='employees'?'active':'' ?>"><i class="bi bi-people"></i> Employees</a>
     <div class="nav-section-label">Payroll</div>
     <a href="history.php"  class="nav-link <?= $current_page==='history'  ?'active':'' ?>"><i class="bi bi-clock-history"></i> Payroll History</a>
+    <div class="nav-section-label">Requests</div>
+    <a href="requests.php" class="nav-link <?= $current_page==='requests' ?'active':'' ?>">
+        <i class="bi bi-inbox"></i> Requests
+        <?php if ($pendingBadge > 0): ?><span class="nav-badge"><?= $pendingBadge ?></span><?php endif; ?>
+    </a>
 
     <?php else: ?>
     <!-- ── ADMIN SIDEBAR ── -->
@@ -141,19 +160,22 @@ function formatMoney(float $amount): string {
     <div class="nav-section-label">Warehouse</div>
     <a href="warehouse.php"class="nav-link <?= $current_page==='warehouse'?'active':'' ?>"><i class="bi bi-database"></i> Data Warehouse</a>
     <div class="nav-section-label">Admin</div>
+    <a href="requests.php" class="nav-link <?= $current_page==='requests' ?'active':'' ?>">
+        <i class="bi bi-inbox"></i> Requests
+        <?php if ($pendingBadge > 0): ?><span class="nav-badge"><?= $pendingBadge ?></span><?php endif; ?>
+    </a>
     <a href="users.php"    class="nav-link <?= $current_page==='users'    ?'active':'' ?>"><i class="bi bi-shield-lock"></i> User Access</a>
     <?php endif; ?>
 
-    <!-- ── Footer: user info + currency toggle ── -->
+    <!-- Footer -->
     <div style="margin-top:auto;padding:16px 24px;border-top:1px solid var(--border);">
         <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:2px;">Logged in as</div>
         <div style="font-size:0.88rem;font-weight:600;color:var(--text-main);"><?= htmlspecialchars($__user['full_name']) ?></div>
         <?php
-        $roleColor = match($__user['role']) { 'Admin'=>'var(--accent)', 'Manager'=>'#4a9eff', 'Employee'=>'#2ecc71', default=>'var(--text-muted)' };
-        $roleIcon  = match($__user['role']) { 'Admin'=>'👑', 'Manager'=>'🏢', 'Employee'=>'👤', default=>'' };
+        $roleColor = match($__user['role']){'Admin'=>'var(--accent)','Manager'=>'#4a9eff','Employee'=>'#2ecc71',default=>'var(--text-muted)'};
+        $roleIcon  = match($__user['role']){'Admin'=>'👑','Manager'=>'🏢','Employee'=>'👤',default=>''};
         ?>
         <div style="font-size:0.75rem;color:<?= $roleColor ?>;margin-bottom:10px;"><?= $roleIcon ?> <?= $__user['role'] ?></div>
-        <!-- Currency toggle -->
         <div class="currency-toggle mb-2">
             <span style="font-size:0.7rem;color:var(--text-muted);margin-right:4px;">Currency:</span>
             <a href="?currency=PHP" class="<?= ($currency==='PHP')?'active':'' ?>">₱ PHP</a>

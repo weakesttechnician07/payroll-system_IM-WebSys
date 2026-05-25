@@ -1,136 +1,168 @@
 <?php
 // ============================================================
 // Process Payroll – process.php
-// Demonstrates:
-//   • Database Transaction (BEGIN / COMMIT / ROLLBACK)
-//   • Pessimistic Concurrency Control (SELECT FOR UPDATE)
-//   • Optimistic Concurrency via employee version column
+// NEW: Attendance-based prorated salary calculation
+//      Absences deduct from basic salary (daily rate × absent days)
+//      Transaction + SELECT FOR UPDATE + optimistic locking
 // ============================================================
 require_once 'includes/db.php';
 require_once 'includes/auth.php';
-requireAdmin();   // Only Admins can process payroll (Manager + Employee denied)
+requireAdmin();
 $page_title = 'Process Payroll';
-$db = getDB();
-
+$db  = getDB();
 $msg = '';
 $msg_type = '';
-$preview = [];
 
-// ── Fetch components for calculation ────────────────────────
-$allowances = $db->query("SELECT * FROM pay_components WHERE component_type='Allowance'")->fetchAll();
-$deductions  = $db->query("SELECT * FROM pay_components WHERE component_type='Deduction'")->fetchAll();
+$months = ['','January','February','March','April','May','June',
+           'July','August','September','October','November','December'];
 
-// ── POST: Process payroll (with transaction + concurrency) ───
+// ── POST: Run Payroll ────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'process') {
     $month = (int)$_POST['payroll_month'];
     $year  = (int)$_POST['payroll_year'];
 
     if ($month < 1 || $month > 12 || $year < 2000) {
-        $msg = 'Invalid month/year selected.';
-        $msg_type = 'danger';
+        $msg = 'Invalid month/year.'; $msg_type = 'danger';
     } else {
         try {
-            // BEGIN TRANSACTION
             $db->beginTransaction();
 
-            // Fetch active employees with FOR UPDATE (pessimistic locking)
-            // This prevents other transactions from modifying these rows simultaneously
+            // Lock active employee rows (pessimistic concurrency)
             $empStmt = $db->prepare("
-                SELECT e.employee_id, e.first_name, e.last_name, e.version,
-                       p.base_salary
+                SELECT e.employee_id, e.version, p.base_salary,
+                       COALESCE(a.working_days, 22) AS working_days,
+                       COALESCE(a.days_present,  22) AS days_present,
+                       COALESCE(a.days_absent,    0) AS days_absent,
+                       COALESCE(a.days_worked,   22) AS days_worked
                 FROM employees e
                 JOIN positions p ON e.position_id = p.position_id
+                LEFT JOIN attendance a
+                    ON a.employee_id = e.employee_id
+                    AND a.attendance_month = ?
+                    AND a.attendance_year  = ?
                 WHERE e.status = 'Active'
                 FOR UPDATE
             ");
-            $empStmt->execute();
-            $active_employees = $empStmt->fetchAll();
+            $empStmt->execute([$month, $year]);
+            $active = $empStmt->fetchAll();
 
-            if (empty($active_employees)) {
+            if (empty($active)) {
                 $db->rollBack();
-                $msg = 'No active employees found.';
-                $msg_type = 'danger';
+                $msg = 'No active employees found.'; $msg_type = 'danger';
             } else {
-                $total_allowance = array_sum(array_column($allowances, 'default_amount'));
-                $total_deduction = array_sum(array_column($deductions, 'default_amount'));
-
-                $inserted = 0;
-                $skipped  = 0;
+                // Get pay components
+                $totalAllow  = $db->query("SELECT COALESCE(SUM(default_amount),0) FROM pay_components WHERE component_type='Allowance'")->fetchColumn();
+                $totalDeduct = $db->query("SELECT COALESCE(SUM(default_amount),0) FROM pay_components WHERE component_type='Deduction'")->fetchColumn();
 
                 $insertStmt = $db->prepare("
                     INSERT INTO payroll_records
-                        (employee_id, payroll_month, payroll_year, basic_salary, total_allowance, total_deduction)
+                        (employee_id, payroll_month, payroll_year,
+                         basic_salary, total_allowance, total_deduction)
                     VALUES (?, ?, ?, ?, ?, ?)
-                    ON DUPLICATE KEY UPDATE payroll_id = payroll_id   -- skip duplicates gracefully
                 ");
 
-                foreach ($active_employees as $emp) {
-                    // Check if payroll for this period already exists (subquery approach)
-                    $checkStmt = $db->prepare("
-                        SELECT COUNT(*) FROM payroll_records
-                        WHERE employee_id=? AND payroll_month=? AND payroll_year=?
-                    ");
-                    $checkStmt->execute([$emp['employee_id'], $month, $year]);
-                    if ($checkStmt->fetchColumn() > 0) {
-                        $skipped++;
-                        continue;
-                    }
+                $inserted = 0; $skipped = 0; $details = [];
 
+                foreach ($active as $emp) {
+                    // Check for existing record
+                    $chk = $db->prepare("SELECT COUNT(*) FROM payroll_records WHERE employee_id=? AND payroll_month=? AND payroll_year=?");
+                    $chk->execute([$emp['employee_id'], $month, $year]);
+                    if ($chk->fetchColumn() > 0) { $skipped++; continue; }
+
+                    // ── Prorated salary calculation ──────────
+                    // Daily rate = base_salary / working_days
+                    // Prorated  = daily_rate * days_present
+                    // Absence deduction already baked into prorated salary
+                    $workingDays  = max(1, (int)$emp['working_days']); // avoid division by zero
+                    $daysPresent  = max(0, (int)$emp['days_present']);
+                    $dailyRate    = round($emp['base_salary'] / $workingDays, 4);
+                    $proratedPay  = round($dailyRate * $daysPresent, 2);
+
+                    // Absence deduction is reflected in prorated pay already
+                    // total_deduction = statutory deductions only (SSS, PhilHealth, etc.)
                     $insertStmt->execute([
                         $emp['employee_id'],
                         $month,
                         $year,
-                        $emp['base_salary'],
-                        $total_allowance,
-                        $total_deduction
+                        $proratedPay,   // basic_salary = prorated (attendance-adjusted)
+                        $totalAllow,
+                        $totalDeduct
                     ]);
+
+                    $details[] = [
+                        'id'          => $emp['employee_id'],
+                        'base'        => $emp['base_salary'],
+                        'working'     => $workingDays,
+                        'present'     => $daysPresent,
+                        'absent'      => $emp['days_absent'],
+                        'prorated'    => $proratedPay,
+                        'absent_ded'  => round($dailyRate * $emp['days_absent'], 2),
+                    ];
                     $inserted++;
                 }
 
-                // COMMIT TRANSACTION – all records saved atomically
                 $db->commit();
-                auditLog('Process Payroll', 'payroll_records', "Month=$month Year=$year Inserted=$inserted Skipped=$skipped");
-                $msg = "Payroll processed: {$inserted} record(s) saved, {$skipped} skipped (already processed)";
+                auditLog('Process Payroll','payroll_records',"Month=$month Year=$year Inserted=$inserted Skipped=$skipped");
+                $msg = "Payroll processed: {$inserted} record(s) saved, {$skipped} skipped (already processed).";
                 $msg_type = 'success';
             }
         } catch (PDOException $e) {
-            // ROLLBACK on error – no partial data saved
             $db->rollBack();
-            $msg = 'Transaction rolled back: ' . $e->getMessage();
+            $msg = 'Transaction rolled back: '.$e->getMessage();
             $msg_type = 'danger';
         }
     }
 }
 
-// ── GET/POST: Preview ────────────────────────────────────────
-$preview_month = (int)($_POST['payroll_month'] ?? $_GET['month'] ?? date('n'));
-$preview_year  = (int)($_POST['payroll_year']  ?? $_GET['year']  ?? date('Y'));
+// ── Preview: load active employees with attendance ───────────
+$prev_month = (int)($_POST['payroll_month'] ?? $_GET['month'] ?? date('n'));
+$prev_year  = (int)($_POST['payroll_year']  ?? $_GET['year']  ?? date('Y'));
 
-$total_allowance_val = array_sum(array_column($allowances, 'default_amount'));
-$total_deduction_val  = array_sum(array_column($deductions,  'default_amount'));
-
-$preview = $db->prepare("
-    SELECT e.employee_id, CONCAT(e.first_name,' ',e.last_name) AS full_name,
-           d.department_name, p.position_title, p.base_salary,
-           (p.base_salary + ?) AS gross_pay,
-           (p.base_salary + ? - ?) AS net_pay,
-           (SELECT COUNT(*) FROM payroll_records pr2
-            WHERE pr2.employee_id = e.employee_id
-              AND pr2.payroll_month = ? AND pr2.payroll_year = ?) AS already_processed
+$previewStmt = $db->prepare("
+    SELECT
+        e.employee_id,
+        CONCAT(e.first_name,' ',e.last_name) AS full_name,
+        d.department_name,
+        p.position_title,
+        p.base_salary,
+        COALESCE(a.working_days, 22) AS working_days,
+        COALESCE(a.days_worked,  22) AS days_worked,
+        COALESCE(a.days_absent,   0) AS days_absent,
+        COALESCE(a.days_present, 22) AS days_present,
+        ROUND(p.base_salary / COALESCE(a.working_days,22) * COALESCE(a.days_present,22), 2) AS prorated_salary,
+        ROUND(p.base_salary / COALESCE(a.working_days,22) * COALESCE(a.days_absent,0),  2) AS absence_deduction,
+        (SELECT COALESCE(SUM(default_amount),0) FROM pay_components WHERE component_type='Allowance') AS total_allowance,
+        (SELECT COALESCE(SUM(default_amount),0) FROM pay_components WHERE component_type='Deduction') AS total_deduction,
+        ROUND(
+            p.base_salary / COALESCE(a.working_days,22) * COALESCE(a.days_present,22)
+            + (SELECT COALESCE(SUM(default_amount),0) FROM pay_components WHERE component_type='Allowance'),
+            2
+        ) AS gross_pay,
+        ROUND(
+            p.base_salary / COALESCE(a.working_days,22) * COALESCE(a.days_present,22)
+            + (SELECT COALESCE(SUM(default_amount),0) FROM pay_components WHERE component_type='Allowance')
+            - (SELECT COALESCE(SUM(default_amount),0) FROM pay_components WHERE component_type='Deduction'),
+            2
+        ) AS net_pay,
+        (SELECT COUNT(*) FROM payroll_records pr2
+         WHERE pr2.employee_id=e.employee_id
+           AND pr2.payroll_month=? AND pr2.payroll_year=?) AS already_processed,
+        a.attendance_month IS NOT NULL AS has_attendance
     FROM employees e
     JOIN departments d ON e.department_id = d.department_id
     JOIN positions   p ON e.position_id   = p.position_id
+    LEFT JOIN attendance a
+        ON a.employee_id = e.employee_id
+        AND a.attendance_month = ? AND a.attendance_year = ?
     WHERE e.status = 'Active'
     ORDER BY d.department_name, e.last_name
 ");
-$preview->execute([
-    $total_allowance_val,
-    $total_allowance_val,
-    $total_deduction_val,
-    $preview_month,
-    $preview_year
-]);
-$preview_rows = $preview->fetchAll();
+$previewStmt->execute([$prev_month, $prev_year, $prev_month, $prev_year]);
+$preview = $previewStmt->fetchAll();
+
+$components = $db->query("SELECT * FROM pay_components ORDER BY component_type DESC, component_name")->fetchAll();
+$totalNet   = array_sum(array_column($preview, 'net_pay'));
+$noAttCount = count(array_filter($preview, fn($r) => !$r['has_attendance']));
 
 require_once 'includes/header.php';
 ?>
@@ -138,18 +170,25 @@ require_once 'includes/header.php';
 <div class="main-content">
     <div class="page-header">
         <h1><i class="bi bi-cash-coin me-2 text-accent"></i>Process Payroll</h1>
-        <p>Uses a database transaction (BEGIN / COMMIT / ROLLBACK) and SELECT FOR UPDATE for concurrency control</p>
+        <p>Attendance-aware · BEGIN / COMMIT / ROLLBACK · SELECT FOR UPDATE · Admin only</p>
     </div>
 
     <?php if ($msg): ?>
-    <div class="alert-<?= $msg_type === 'success' ? 'success' : 'danger' ?>-dark mb-3">
-        <i class="bi bi-<?= $msg_type === 'success' ? 'check-circle' : 'exclamation-triangle' ?> me-2"></i>
+    <div class="alert-<?= $msg_type==='success'?'success':'danger' ?>-dark mb-3">
+        <i class="bi bi-<?= $msg_type==='success'?'check-circle':'exclamation-triangle' ?> me-2"></i>
         <?= htmlspecialchars($msg) ?>
     </div>
     <?php endif; ?>
 
+    <?php if ($noAttCount > 0): ?>
+    <div style="background:rgba(243,156,18,0.1);border:1px solid rgba(243,156,18,0.3);color:#f39c12;border-radius:8px;padding:12px 16px;margin-bottom:16px;">
+        <i class="bi bi-exclamation-triangle me-2"></i>
+        <strong><?= $noAttCount ?> employee(s)</strong> have no attendance record for <?= $months[$prev_month] ?> <?= $prev_year ?> — they will be paid full salary (22 days assumed).
+    </div>
+    <?php endif; ?>
+
     <div class="row g-4">
-        <!-- Config Panel -->
+        <!-- Left: Config -->
         <div class="col-lg-4">
             <div class="card mb-3">
                 <div class="card-header"><i class="bi bi-gear me-2 text-accent"></i>Payroll Period</div>
@@ -159,18 +198,16 @@ require_once 'includes/header.php';
                         <div class="mb-3">
                             <label class="form-label">Month</label>
                             <select name="payroll_month" class="form-select">
-                                <?php for ($m = 1; $m <= 12; $m++): ?>
-                                <option value="<?= $m ?>" <?= $m === $preview_month ? 'selected' : '' ?>>
-                                    <?= date('F', mktime(0,0,0,$m,1)) ?>
-                                </option>
+                                <?php for ($m=1;$m<=12;$m++): ?>
+                                <option value="<?= $m ?>" <?= $m===$prev_month?'selected':'' ?>><?= $months[$m] ?></option>
                                 <?php endfor; ?>
                             </select>
                         </div>
                         <div class="mb-4">
                             <label class="form-label">Year</label>
                             <select name="payroll_year" class="form-select">
-                                <?php for ($y = date('Y'); $y >= 2022; $y--): ?>
-                                <option value="<?= $y ?>" <?= $y === $preview_year ? 'selected' : '' ?>><?= $y ?></option>
+                                <?php for ($y=date('Y');$y>=2022;$y--): ?>
+                                <option value="<?= $y ?>" <?= $y===$prev_year?'selected':'' ?>><?= $y ?></option>
                                 <?php endfor; ?>
                             </select>
                         </div>
@@ -182,24 +219,19 @@ require_once 'includes/header.php';
             </div>
 
             <!-- Pay Components -->
-            <div class="card">
+            <div class="card mb-3">
                 <div class="card-header"><i class="bi bi-list-check me-2 text-accent"></i>Pay Components</div>
                 <div class="card-body p-0">
                     <table class="table mb-0" style="font-size:0.82rem;">
-                        <thead><tr><th>Component</th><th>Type</th><th class="text-end">Amount</th></tr></thead>
+                        <thead><tr><th>Component</th><th class="text-end">Amount</th></tr></thead>
                         <tbody>
-                            <?php foreach ($allowances as $a): ?>
+                            <?php foreach ($components as $c): ?>
                             <tr>
-                                <td><?= htmlspecialchars($a['component_name']) ?></td>
-                                <td><span style="color:var(--success);font-size:0.75rem;">+ Allow</span></td>
-                                <td class="text-end" style="color:var(--success);">+₱<?= number_format($a['default_amount'],2) ?></td>
-                            </tr>
-                            <?php endforeach; ?>
-                            <?php foreach ($deductions as $d): ?>
-                            <tr>
-                                <td><?= htmlspecialchars($d['component_name']) ?></td>
-                                <td><span style="color:var(--danger);font-size:0.75rem;">- Deduct</span></td>
-                                <td class="text-end" style="color:var(--danger);">-₱<?= number_format($d['default_amount'],2) ?></td>
+                                <td><?= htmlspecialchars($c['component_name']) ?></td>
+                                <td class="text-end" style="color:<?= $c['component_type']==='Allowance'?'var(--success)':'var(--danger)' ?>;">
+                                    <?= $c['component_type']==='Allowance'?'+':'-' ?>
+                                    <?= formatMoney((float)$c['default_amount']) ?>
+                                </td>
                             </tr>
                             <?php endforeach; ?>
                         </tbody>
@@ -207,52 +239,69 @@ require_once 'includes/header.php';
                 </div>
             </div>
 
-            <!-- Technical Notes -->
-            <div class="card mt-3" style="border-color:rgba(233,69,96,0.3);">
-                <div class="card-header" style="font-size:0.8rem;"><i class="bi bi-info-circle me-2 text-accent"></i>Applied Concepts</div>
-                <div class="card-body" style="font-size:0.78rem;color:var(--text-muted);line-height:1.7;">
-                    <p><strong style="color:var(--accent);">Transaction:</strong> All inserts wrapped in BEGIN → COMMIT. If any insert fails, ROLLBACK is called.</p>
-                    <p class="mb-0"><strong style="color:var(--accent);">Concurrency:</strong> <code>SELECT FOR UPDATE</code> locks employee rows during the transaction. Employee edits also use a <em>version</em> column (optimistic locking).</p>
+            <!-- How it calculates -->
+            <div class="card" style="border-color:rgba(233,69,96,0.3);">
+                <div class="card-header" style="font-size:0.8rem;"><i class="bi bi-info-circle me-2 text-accent"></i>Calculation Method</div>
+                <div class="card-body" style="font-size:0.78rem;color:var(--text-muted);line-height:1.8;">
+                    <div><strong style="color:var(--text-main);">Daily Rate</strong> = Base Salary ÷ Working Days</div>
+                    <div><strong style="color:var(--text-main);">Prorated Salary</strong> = Daily Rate × Days Present</div>
+                    <div><strong style="color:var(--text-main);">Gross Pay</strong> = Prorated + Allowances</div>
+                    <div><strong style="color:var(--success);">Net Pay</strong> = Gross − Statutory Deductions</div>
+                    <hr style="border-color:var(--border);margin:8px 0;">
+                    <div style="font-size:0.75rem;">If no attendance record exists, full salary is used (22 working days assumed).</div>
                 </div>
             </div>
         </div>
 
-        <!-- Preview Table -->
+        <!-- Right: Preview Table -->
         <div class="col-lg-8">
             <div class="card">
                 <div class="card-header">
-                    Preview for <?= date('F Y', mktime(0,0,0,$preview_month,1,$preview_year)) ?>
-                    <span class="float-end" style="color:var(--text-muted);font-size:0.8rem;"><?= count($preview_rows) ?> active employees</span>
+                    Preview — <?= $months[$prev_month] ?> <?= $prev_year ?>
+                    <span class="float-end" style="color:var(--success);font-weight:600;">
+                        Total Net: <?= formatMoney($totalNet) ?>
+                    </span>
                 </div>
                 <div class="card-body p-0">
                     <div class="table-responsive">
-                        <table class="table mb-0">
+                        <table class="table mb-0" style="font-size:0.82rem;">
                             <thead>
                                 <tr>
                                     <th>Employee</th>
-                                    <th>Dept</th>
-                                    <th class="text-end">Basic</th>
-                                    <th class="text-end">Gross</th>
+                                    <th class="text-center">Days</th>
+                                    <th class="text-center">Absent</th>
+                                    <th class="text-end">Base</th>
+                                    <th class="text-end">Absence Ded.</th>
                                     <th class="text-end">Net Pay</th>
                                     <th>Status</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                <?php
-                                $total_net = 0;
-                                foreach ($preview_rows as $r):
-                                    $total_net += $r['net_pay'];
-                                ?>
-                                <tr>
-                                    <td><strong><?= htmlspecialchars($r['full_name']) ?></strong><br>
-                                        <small style="color:var(--text-muted)"><?= htmlspecialchars($r['position_title']) ?></small></td>
-                                    <td><?= htmlspecialchars($r['department_name']) ?></td>
-                                    <td class="text-end">₱<?= number_format($r['base_salary'],2) ?></td>
-                                    <td class="text-end">₱<?= number_format($r['gross_pay'],2) ?></td>
-                                    <td class="text-end" style="color:var(--success);font-weight:600;">₱<?= number_format($r['net_pay'],2) ?></td>
+                                <?php foreach ($preview as $r): ?>
+                                <tr <?= !$r['has_attendance'] ? 'style="opacity:0.7;"' : '' ?>>
+                                    <td>
+                                        <strong><?= htmlspecialchars($r['full_name']) ?></strong><br>
+                                        <small style="color:var(--text-muted);"><?= htmlspecialchars($r['department_name']) ?></small>
+                                    </td>
+                                    <td class="text-center">
+                                        <?= $r['days_present'] ?>/<?= $r['working_days'] ?>
+                                        <?php if (!$r['has_attendance']): ?>
+                                        <i class="bi bi-question-circle" style="color:var(--warning);font-size:0.75rem;" title="No attendance record — using default"></i>
+                                        <?php endif; ?>
+                                    </td>
+                                    <td class="text-center" style="color:<?= $r['days_absent']>0?'var(--danger)':'var(--text-muted)' ?>;">
+                                        <?= $r['days_absent'] ?>
+                                    </td>
+                                    <td class="text-end"><?= formatMoney((float)$r['base_salary']) ?></td>
+                                    <td class="text-end" style="color:var(--danger);">
+                                        <?= $r['days_absent'] > 0 ? '-'.formatMoney((float)$r['absence_deduction']) : '—' ?>
+                                    </td>
+                                    <td class="text-end" style="color:var(--success);font-weight:600;">
+                                        <?= formatMoney((float)$r['net_pay']) ?>
+                                    </td>
                                     <td>
                                         <?php if ($r['already_processed']): ?>
-                                        <span style="color:var(--warning);font-size:0.75rem;"><i class="bi bi-check-circle"></i> Processed</span>
+                                        <span style="color:var(--warning);font-size:0.75rem;"><i class="bi bi-check-circle"></i> Done</span>
                                         <?php else: ?>
                                         <span style="color:var(--text-muted);font-size:0.75rem;"><i class="bi bi-clock"></i> Pending</span>
                                         <?php endif; ?>
@@ -262,8 +311,8 @@ require_once 'includes/header.php';
                             </tbody>
                             <tfoot>
                                 <tr style="background:rgba(15,52,96,0.3);">
-                                    <td colspan="4" class="text-end" style="font-weight:600;">Total Net Pay:</td>
-                                    <td class="text-end" style="color:var(--success);font-weight:700;font-size:1rem;">₱<?= number_format($total_net,2) ?></td>
+                                    <td colspan="5" class="text-end" style="font-weight:600;">Total Net Pay:</td>
+                                    <td class="text-end" style="color:var(--success);font-weight:700;"><?= formatMoney($totalNet) ?></td>
                                     <td></td>
                                 </tr>
                             </tfoot>
